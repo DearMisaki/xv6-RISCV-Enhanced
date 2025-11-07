@@ -1,10 +1,13 @@
 #include "types.h"
 #include "riscv.h"
-#include "defs.h"
 #include "param.h"
+#include "defs.h"
 #include "memlayout.h"
 #include "spinlock.h"
 #include "proc.h"
+#ifdef PGTBL_SOL
+#include "riscv.h"
+#endif
 #include "vm.h"
 
 uint64
@@ -68,6 +71,7 @@ sys_pause(void)
   int n;
   uint ticks0;
 
+
   argint(0, &n);
   if(n < 0)
     n = 0;
@@ -83,6 +87,37 @@ sys_pause(void)
   release(&tickslock);
   return 0;
 }
+
+
+#ifdef LAB_PGTBL
+int
+sys_pgpte(void)
+{
+  uint64 va;
+  struct proc *p;  
+
+  p = myproc();
+  argaddr(0, &va);
+  pte_t *pte = pgpte(p->pagetable, va);
+  if(pte != 0) {
+      return (uint64) *pte;
+  }
+  return 0;
+}
+#endif
+
+#ifdef LAB_PGTBL
+int
+sys_kpgtbl(void)
+{
+  struct proc *p;  
+
+  p = myproc();
+  vmprint(p->pagetable);
+  return 0;
+}
+#endif
+
 
 uint64
 sys_kill(void)
@@ -105,3 +140,20 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+#ifdef LAB_LOCK
+uint64
+sys_cpupin(void)
+{
+  struct proc *p = myproc();
+  int cpu;
+
+  argint(0, &cpu);
+  if (cpu < 0 || cpu >= NCPU)
+    return -1;
+  acquire(&p->lock);
+  p->pincpu = &cpus[cpu];
+  release(&p->lock);
+  return 0;
+}
+#endif
