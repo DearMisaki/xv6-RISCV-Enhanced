@@ -105,3 +105,18 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64 sys_interpose(void)
+{
+  int mask;
+  
+  argint(0, &mask);
+  if (mask < 0)
+    return -1;
+
+  argstr(1, myproc()->allowed_path_open_exec, MAXPATH);
+
+  myproc()->mask = mask;
+
+  return 0;
+}
