@@ -197,6 +197,7 @@ UPROGS=\
 	$U/_dorphan\
 	$U/_sandbox\
 	$U/_attack\
+	$U/_freemem\
 
 
 ifeq ($(LAB),util)

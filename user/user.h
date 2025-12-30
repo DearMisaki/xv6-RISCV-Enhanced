@@ -25,6 +25,7 @@ char* sys_sbrk(int,int);
 int pause(int);
 int uptime(void);
 int interpose(int, char*);
+int freemem(void);
 
 // ulib.c
 int stat(const char*, struct stat*);
