@@ -4,6 +4,8 @@
 #include "riscv.h"
 #include "defs.h"
 
+uint64 dtb_addr;
+
 void main();
 void timerinit();
 
@@ -12,8 +14,11 @@ __attribute__ ((aligned (16))) char stack0[4096 * NCPU];
 
 // entry.S jumps here in machine mode on stack0.
 void
-start()
+start(uint64 mhartid, uint64 dtb)
 {
+  // 保存 dtb 地址到全局变量
+  dtb_addr = dtb;
+
   // set M Previous Privilege mode to Supervisor, for mret.
   unsigned long x = r_mstatus();
   x &= ~MSTATUS_MPP_MASK;

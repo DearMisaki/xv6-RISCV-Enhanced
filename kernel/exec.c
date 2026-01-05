@@ -86,11 +86,15 @@ kexec(char *path, char **argv)
   // Use the rest as the user stack.
   sz = PGROUNDUP(sz);
   uint64 sz1;
+  // 分配栈使用的内存
   if((sz1 = uvmalloc(pagetable, sz, sz + (USERSTACK+1)*PGSIZE, PTE_W)) == 0)
     goto bad;
   sz = sz1;
+  // 设置保护页，清空其 flag
   uvmclear(pagetable, sz-(USERSTACK+1)*PGSIZE);
+  // 此时sp指向高地址
   sp = sz;
+  // 栈的底边界，不是常说的栈底
   stackbase = sp - USERSTACK*PGSIZE;
 
   // Copy argument strings into new stack, remember their
@@ -127,7 +131,7 @@ kexec(char *path, char **argv)
       last = s+1;
   safestrcpy(p->name, last, sizeof(p->name));
     
-  // Commit to the user image.
+  // Commit to the user image. 替换内存镜像
   oldpagetable = p->pagetable;
   p->pagetable = pagetable;
   p->sz = sz;
