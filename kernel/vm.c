@@ -188,8 +188,42 @@ walkaddr(pagetable_t pagetable, uint64 va)
 
 #if defined(LAB_PGTBL) || defined(SOL_MMAP) || defined(SOL_COW)
 void
-vmprint(pagetable_t pagetable) {
-  // your code here
+vmprint_recursive(pagetable_t pagetable, int level, uint64 va)
+{
+  for (int i = 0; i < 512; ++i)
+  {
+    pte_t pte = pagetable[i];
+
+    // 条目有效
+    if (pte & PTE_V)
+    {
+      uint64 current_va = va | ((uint64)i << (level * 9 + 12));
+
+      uint64 pa = PTE2PA(pte);
+
+      for (int i = 0; i < 3 - level; ++i)
+      {
+        printf(" ..");
+      }
+
+      printf("0x%lx: pte 0x%lx pa 0x%lx\n", current_va, pte, pa);
+
+      // 不是叶子节点，进入下一级页表
+      if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+        pagetable_t next_pt = (pagetable_t)pa;
+        if (level > 0) {
+          vmprint_recursive(next_pt, level - 1, current_va);
+        }
+      }
+    }
+  }
+}
+
+void
+vmprint(pagetable_t pagetable)
+{
+  printf("page table %p\n", pagetable);
+  vmprint_recursive(pagetable, 2, 0);
 }
 #endif
 
