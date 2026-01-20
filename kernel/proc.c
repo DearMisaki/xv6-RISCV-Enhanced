@@ -122,6 +122,33 @@ allocproc(void)
   return 0;
 
 found:
+
+  // 创建进程独有的内核页表
+  p->kpagetable = kvmmake();
+  if(p->kpagetable == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // 分配一页的内核栈空间
+  char* pa = kalloc();
+  if (pa == 0)
+  {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // 将分配的物理地址映射到 p->kstack，这个地址已经在 procinit 中计算好了
+  if (mappages(p->kpagetable, p->kstack, PGSIZE, (uint64) pa, PTE_R | PTE_W) != 0)
+  {
+    kfree(pa);
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
   p->pid = allocpid();
   p->state = USED;
 
@@ -131,6 +158,15 @@ found:
     release(&p->lock);
     return 0;
   }
+
+  // lab 加速系统调用
+  if ((p->usyscall = (struct usyscall *)kalloc()) == 0)
+  {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  p->usyscall->pid = p->pid;
 
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
@@ -158,8 +194,30 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+
+  if (p->usyscall)
+  {
+    kfree((void *)p->usyscall);
+  }
+  p->usyscall = 0;
+
+  // 因为 kstack 修改为进程创建时分配，所以进程销毁时需要释放
+  // 原来的代码中 kstack 时系统启动时为 NPROCS 个进程统一分配，持久存在
+  if (p->kstack)
+  {
+    pte_t *pte = walk(p->kpagetable, p->kstack, 0);
+    if (pte && (*pte & PTE_V))
+    {
+      kfree((void*)PTE2PA(*pte));
+    }
+
+    uvmunmap(p->kpagetable, p->kstack, 1, 0);
+  }
+
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  if (p->kpagetable)
+    proc_free_kpagetable(p->kpagetable);
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -202,6 +260,15 @@ proc_pagetable(struct proc *p)
     return 0;
   }
 
+  if(mappages(pagetable, USYSCALL, PGSIZE,
+              (uint64)(p->usyscall), PTE_R | PTE_U) < 0){
+    // 如果映射失败，记得清理之前分配的资源
+    uvmunmap(pagetable, TRAPFRAME, 1, 0);
+    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+    uvmfree(pagetable, 0);
+    return 0;
+  }
+
   return pagetable;
 }
 
@@ -212,7 +279,49 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
+  uvmunmap(pagetable, USYSCALL, 1, 0);
   uvmfree(pagetable, sz);
+}
+
+// 递归释放页表页，但不释放叶子节点指向的物理内存
+void
+proc_free_kpagetable(pagetable_t kpagetable)
+{
+  // 1. 遍历当前页表的 512 个页表项 (PTE)
+  for(int i = 0; i < 512; i++){
+    pte_t pte = kpagetable[i];
+
+    // 2. 如果该页表项是有效的
+    if(pte & PTE_V){
+      
+      // 3. 检查是否为“中间目录页”
+      // 在 RISC-V Sv39 中，如果 PTE 有效，但 R/W/X 位全为 0，
+      // 说明它指向的是下一级页表，而不是物理内存。
+      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
+        
+        // 获取下一级页表的物理地址
+        uint64 child = PTE2PA(pte);
+        
+        // 递归处理下一级
+        proc_free_kpagetable((pagetable_t)child);
+        
+        // 清除当前项 (可选，反正马上要 free 了)
+        kpagetable[i] = 0;
+      } 
+      // 4. 如果是“叶子节点” (R/W/X 位不全为0)
+      else {
+        // 这种情况说明指向的是具体的物理内存：
+        //   - 可能是内核代码段 (Shared)
+        //   - 可能是用户数据 (User owned)
+        //   - 可能是设备内存 (UART/PLIC)
+        // 无论哪种，我们都【绝对不能】在这里调用 kfree。
+        // 所以这里什么都不做，直接跳过。
+      }
+    }
+  }
+
+  // 5. 循环结束后，释放当前这一页页表本身
+  kfree((void*)kpagetable);
 }
 
 // Set up first user process.
@@ -223,6 +332,8 @@ userinit(void)
 
   p = allocproc();
   initproc = p;
+
+  u2kvmcopy(p->pagetable, p->kpagetable, 0, p->sz);
   
   p->cwd = namei("/");
 
@@ -237,15 +348,30 @@ int
 growproc(int n)
 {
   uint64 sz;
+  uint64 oldsz; // 【新增】保存旧大小
   struct proc *p = myproc();
 
   sz = p->sz;
   if(n > 0){
+    oldsz = sz; // 【关键步骤】记录分配前的大小
+    
+    // uvmalloc 会返回分配后的新大小
     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
+      return -1;
+    }
+    
+    // 使用 oldsz 作为复制的起始地址
+    if(u2kvmcopy(p->pagetable, p->kpagetable, oldsz, n) < 0) {
+      uvmdealloc(p->pagetable, sz, oldsz); // 回滚
       return -1;
     }
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    // 缩小内存时，同步移除内核映射
+    if (PGROUNDUP(sz) < PGROUNDUP(p->sz)) {
+       int npages = (PGROUNDUP(p->sz) - PGROUNDUP(sz)) / PGSIZE;
+       uvmunmap(p->kpagetable, PGROUNDUP(sz), npages, 0);
+    }
   }
   p->sz = sz;
   return 0;
@@ -272,6 +398,13 @@ kfork(void)
     return -1;
   }
   np->sz = p->sz;
+
+  // 【新增】同步父进程的内存到子进程的内核页表
+  if(u2kvmcopy(np->pagetable, np->kpagetable, 0, np->sz) < 0){
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -434,6 +567,9 @@ scheduler(void)
     intr_on();
     intr_off();
 
+    // 没有运行的进程必须切换回全局内核页表
+    kpgtbl2satp();
+
     int found = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
@@ -443,7 +579,16 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        // 将 stap 切换到进程的内核页表 
+        sfence_vma();
+        w_satp(MAKE_SATP(p->kpagetable));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
+
+        // 进程切出，再次切换到全局内核页表
+        kpgtbl2satp();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.

@@ -56,7 +56,6 @@ kvmmake(void)
   kvmmap(kpgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 
   // allocate and map a kernel stack for each process.
-  proc_mapstacks(kpgtbl);
   
   return kpgtbl;
 }
@@ -66,6 +65,50 @@ void
 kvminit(void)
 {
   kernel_pagetable = kvmmake();
+}
+
+// 将全局页表重新写回 stap 寄存器
+void kpgtbl2satp(void)
+{
+  sfence_vma();
+
+  w_satp(MAKE_SATP(kernel_pagetable));
+
+  sfence_vma();
+}
+
+// 拷贝进程页表到进程独立的内核页表
+int u2kvmcopy(pagetable_t upagtbl, pagetable_t kpagtbl, uint64 start, uint64 sz)
+{
+  pte_t *pte;
+  uint64 pa, i;
+  uint flags;
+  // 对齐向下
+  start = PGROUNDUP(start);
+  
+  for(i = start; i < start + sz; i += PGSIZE){
+    // 获取用户页表的 PTE
+    if((pte = walk(upagtbl, i, 0)) == 0)
+      continue;
+    if((*pte & PTE_V) == 0)
+      continue;
+    
+    pa = PTE2PA(*pte);
+    
+    // 获取原有标志位，但必须关闭 PTE_U
+    // 因为 RISC-V S模式下，默认不能访问设置了 U 位的页
+    flags = PTE_FLAGS(*pte) & (~PTE_U);
+
+    // 映射到内核页表
+    if(mappages(kpagtbl, i, PGSIZE, pa, flags) != 0)
+      goto err;
+  }
+  return 0;
+
+err:
+  // 发生错误时，应该取消之前的映射 (简略版可直接 panic)
+  uvmunmap(kpagtbl, start, (i-start)/PGSIZE, 0);
+  return -1;
 }
 
 // Switch the current CPU's h/w page table register to
@@ -420,28 +463,18 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 // Copy from user to kernel.
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
+// 进程双页表版本 
+// 替换原有的 copyin
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
-  
-  while(len > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
-        return -1;
-      }
-    }
-    n = PGSIZE - (srcva - va0);
-    if(n > len)
-      n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
+  uint64 limit = PLIC; // 必须限制在 PLIC 以下，防止覆盖设备映射
 
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
+  if(srcva >= limit || srcva + len > limit || srcva + len < srcva)
+    return -1;
+
+  // 直接拷贝！利用当前的 satp (即 p->kpagetable)
+  memmove((void*)dst, (void*)srcva, len);
   return 0;
 }
 
@@ -449,46 +482,24 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 // Copy bytes to dst from virtual address srcva in a given page table,
 // until a '\0', or max.
 // Return 0 on success, -1 on error.
+// 替换原有的 copyinstr
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
-  int got_null = 0;
+  uint64 limit = PLIC;
+  uint64 i;
+  char *p = (char *)srcva;
 
-  while(got_null == 0 && max > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
+  for(i = 0; i < max; i++){
+    if((uint64)(p + i) >= limit)
       return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > max)
-      n = max;
-
-    char *p = (char *) (pa0 + (srcva - va0));
-    while(n > 0){
-      if(*p == '\0'){
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
+    
+    dst[i] = p[i]; // 硬件地址翻译
+    if(p[i] == '\0')
+      return 0;
   }
-  if(got_null){
-    return 0;
-  } else {
-    return -1;
-  }
+  return -1;
 }
-
-
 
 
 // allocate and map user memory if process is referencing a page
@@ -516,6 +527,14 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
     kfree((void *)mem);
     return 0;
   }
+
+  if (mappages(p->kpagetable, va, PGSIZE, mem, PTE_W|PTE_R) != 0) {
+     // 处理错误，如 undo 用户页表映射并 free mem
+     uvmunmap(p->pagetable, va, 1, 0); 
+     kfree((void *)mem);
+     return 0;
+  }
+  
   return mem;
 }
 

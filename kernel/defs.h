@@ -92,6 +92,7 @@ int             growproc(int);
 void            proc_mapstacks(pagetable_t);
 pagetable_t     proc_pagetable(struct proc *);
 void            proc_freepagetable(pagetable_t, uint64);
+void            proc_free_kpagetable(pagetable_t kpagetable);
 int             kkill(int);
 int             killed(struct proc*);
 void            setkilled(struct proc*);
@@ -167,6 +168,7 @@ void            uartputc_sync(int);
 int             uartgetc(void);
 
 // vm.c
+pagetable_t     kvmmake(void);
 void            kvminit(void);
 void            kvminithart(void);
 void            kvmmap(pagetable_t, uint64, uint64, uint64, int);
@@ -191,6 +193,9 @@ void            vmprint(pagetable_t);
 #ifdef LAB_PGTBL
 pte_t*          pgpte(pagetable_t, uint64);
 #endif
+
+void            kpgtbl2satp(void);
+int             u2kvmcopy(pagetable_t upagtbl, pagetable_t kpagtbl, uint64 start, uint64 sz);
 
 // plic.c
 void            plicinit(void);
