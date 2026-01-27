@@ -145,20 +145,32 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
 
   for(int level = 2; level > 0; level--) {
     pte_t *pte = &pagetable[PX(level, va)];
+
     if(*pte & PTE_V) {
-      pagetable = (pagetable_t)PTE2PA(*pte);
-#ifdef LAB_PGTBL
-      if(PTE_LEAF(*pte)) {
-        return pte;
+      // --- 关键修正：精确识别大页 ---
+      // 只有在 Level 1，且 R/W/X 位被设置时，才作为大页返回。
+      // 如果只是 V=1 但没有权限位，说明它是指向下一级的目录，必须继续向下走。
+      if(level == 1 && (*pte & (PTE_R|PTE_W|PTE_X))) {
+          return pte;
       }
-#endif
+      
+      // 更新 pagetable 为下一级页表的物理地址
+      pagetable = (pagetable_t)PTE2PA(*pte);
+      
     } else {
+      // 如果不存在且 alloc=0，返回 null
       if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
         return 0;
+      
       memset(pagetable, 0, PGSIZE);
+      
+      // 建立新的目录项：指向下一级页表
+      // 注意：这里只设置 V，不设置 R/W/X
       *pte = PA2PTE(pagetable) | PTE_V;
     }
   }
+  
+  // 走到 Level 0，返回最终的 PTE
   return &pagetable[PX(0, va)];
 }
 
@@ -275,6 +287,74 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   return 0;
 }
 
+// 映射一个大页
+int
+mappages_super(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+{
+uint64 a, last;
+  pte_t *pte;
+
+  // 1. 参数检查：必须是 2MB 对齐
+  if(size == 0)
+    panic("mappages_super: size");
+  
+  if(va % SUPERPGSIZE != 0)
+    panic("mappages_super: va not aligned");
+
+  if(pa % SUPERPGSIZE != 0)
+    panic("mappages_super: pa not aligned");
+
+  a = va;
+  last = va + size;
+
+  for(;;){
+    // --- 手动 Walk 第一层 (Level 2) ---
+    // 获取 Level 2 的 PTE（根页表项）
+    pte = &pagetable[PX(2, a)];
+
+    // 如果 Level 2 条目无效（即还没有分配对应的 Level 1 页表）
+    if(!(*pte & PTE_V)){
+      // 分配一个新的物理页作为 Level 1 页表
+      pagetable_t new_l1_table = (pagetable_t)kalloc();
+      if(new_l1_table == 0)
+        return -1; // 内存分配失败
+      
+      memset(new_l1_table, 0, PGSIZE);
+      
+      // 让 Level 2 的 PTE 指向这个新分配的 Level 1 页表
+      // 注意：这里是目录项，只需要 PTE_V，不需要 R/W/X
+      *pte = PA2PTE(new_l1_table) | PTE_V;
+    }
+
+    // --- 查找/设置 Level 1 (目标层级) ---
+    // 获取 Level 1 页表的地址
+    pagetable_t l1_pagetable = (pagetable_t)PTE2PA(*pte);
+    
+    // 获取 Level 1 的 PTE 指针
+    pte = &l1_pagetable[PX(1, a)];
+
+    // 检查是否已经存在映射 (Remap)
+    if(*pte & PTE_V)
+      panic("mappages_super: remap");
+
+    // --- 核心步骤：写入大页映射 ---
+    // 这里的 pa 是 2MB 物理大块的起始地址
+    // perm 包含了 PTE_R/W/X/U 等标志
+    // PTE_V 标记该条目有效
+    // 关键：由于 PTE_R/W/X 中至少有一位被设置，硬件会知道这是叶子节点（大页）
+    *pte = PA2PTE(pa) | perm | PTE_V;
+
+    // --- 循环控制 ---
+    a += SUPERPGSIZE;
+    pa += SUPERPGSIZE;
+    
+    if(a == last)
+      break;
+  }
+  
+  return 0;
+}
+
 // create an empty user page table.
 // returns 0 if out of memory.
 pagetable_t
@@ -291,24 +371,91 @@ uvmcreate()
 // Remove npages of mappings starting from va. va must be
 // page-aligned. It's OK if the mappings don't exist.
 // Optionally free the physical memory.
+// kernel/vm.c
+
+// kernel/vm.c
+
 void
 uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 {
   uint64 a;
   pte_t *pte;
-  int sz = PGSIZE;
 
   if((va % PGSIZE) != 0)
     panic("uvmunmap: not aligned");
 
-  for(a = va; a < va + npages*PGSIZE; a += sz){
-    if((pte = walk(pagetable, a, 0)) == 0) // leaf page table entry allocated?
-      continue;
-    if((*pte & PTE_V) == 0)  // has physical page been allocated?
-      continue;
-    sz = PGSIZE;
+  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+    pte = walk(pagetable, a, 0);
+    if(pte == 0)
+      panic("uvmunmap: walk");
+    if((*pte & PTE_V) == 0)
+      panic("uvmunmap: not mapped");
+
+    // --- 区分大页与普通页的核心逻辑 ---
+    
+    // 1. 获取 Level 2 的 PTE
+    pte_t *pte_l2 = &pagetable[PX(2, a)];
+    
+    // 2. 计算出 Level 1 的 PTE 地址
+    // 注意：我们需要确保 L2 是指向下一级的，但既然 walk 成功了，这肯定没问题
+    pagetable_t pgtbl_l1 = (pagetable_t)PTE2PA(*pte_l2);
+    pte_t *pte_l1 = &pgtbl_l1[PX(1, a)];
+
+    // 3. 判断 walk 返回的是否就是 Level 1 的 PTE
+    // 如果 walk 返回的指针地址 == 我们计算出的 Level 1 PTE 地址
+    // 并且它有权限位，那它才是真正的大页！
+    int is_super = (pte == pte_l1) && (*pte & (PTE_R|PTE_W|PTE_X));
+
+    if (is_super) {
+      // ===========================
+      //      大页处理逻辑
+      // ===========================
+      if ((a % SUPERPGSIZE == 0) && (npages - (a-va)/PGSIZE >= 512)) {
+        // 方案 A: 整体释放
+        uint64 pa = PTE2PA(*pte);
+        if(do_free){
+          superfree((void*)pa);
+        }
+        *pte = 0;
+        a += SUPERPGSIZE - PGSIZE; 
+        continue;
+      } else {
+        // 方案 B: 拆分 (Demote)
+        // ... (保持你之前的拆分代码不变) ...
+        
+        // 1. 保存旧的大页物理地址和权限
+        uint64 old_pa = PTE2PA(*pte);
+        int old_perm = PTE_FLAGS(*pte);
+        
+        // 2. 分配一个新的 Level 0 页表
+        char *new_pt = kalloc();
+        if(new_pt == 0) panic("uvmunmap: kalloc demote");
+        memset(new_pt, 0, PGSIZE);
+        
+        // 3. 填充新页表
+        pte_t *level0_pt = (pte_t*)new_pt;
+        for(int i = 0; i < 512; i++){
+          level0_pt[i] = PA2PTE(old_pa + i*PGSIZE) | old_perm | PTE_V;
+        }
+        
+        // 4. 更新 L1 PTE 指向新页表 (Directory, No Perms)
+        *pte = PA2PTE(new_pt) | PTE_V;
+        
+        sfence_vma(); 
+        
+        // 重新 walk 获取 Level 0 的 PTE
+        pte = walk(pagetable, a, 0);
+      }
+    }
+
+    // ===========================
+    //      普通页处理逻辑
+    // ===========================
+    // 此时 pte 指向的是 Level 0 的叶子节点
+    // 或者 demote 之后重新 walk 得到的 Level 0 节点
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
+    
     if(do_free){
       uint64 pa = PTE2PA(*pte);
       kfree((void*)pa);
@@ -320,6 +467,11 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 
 // Allocate PTEs and physical memory to grow process from oldsz to
 // newsz, which need not be page aligned.  Returns new size or 0 on error.
+// 确保你有 SUPERPGSIZE 定义，通常在 kernel/riscv.h
+#ifndef SUPERPGSIZE
+#define SUPERPGSIZE (2L * 1024 * 1024)
+#endif
+
 uint64
 uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
 {
@@ -331,16 +483,47 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
     return oldsz;
 
   oldsz = PGROUNDUP(oldsz);
+  
+  // 循环步长由 sz 动态决定
   for(a = oldsz; a < newsz; a += sz){
+    
+    // --- 尝试使用大页 ---
+    // 条件：
+    // 1. 当前地址 a 是 2MB 对齐的
+    // 2. 剩余需要的空间 (newsz - a) 足够放下 2MB
+    if((a % SUPERPGSIZE == 0) && (a + SUPERPGSIZE <= newsz)){
+      mem = superalloc(); // 尝试分配大页
+      if(mem != 0){
+        sz = SUPERPGSIZE; // 成功！本次循环步进 2MB
+        
+        // 初始化内存 (大页通常不清零，但为了安全建议清零，或者依赖分配器的初始化)
+        memset(mem, 0, sz); 
+
+        // 调用我们之前写的 mappages_super
+        if(mappages_super(pagetable, a, sz, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
+          superfree(mem);
+          uvmdealloc(pagetable, a, oldsz); // 清理已分配的部分
+          return 0;
+        }
+        
+        // 成功处理完大页，直接进入下一次循环
+        continue; 
+      }
+      // 如果 superalloc 返回 0（大页用光了），则 Fallback 到下面的普通页逻辑
+    }
+
+    // --- 普通页逻辑 (4KB) ---
     sz = PGSIZE;
     mem = kalloc();
     if(mem == 0){
       uvmdealloc(pagetable, a, oldsz);
       return 0;
     }
+    
 #ifndef LAB_SYSCALL
     memset(mem, 0, sz);
- #endif
+#endif
+
     if(mappages(pagetable, a, sz, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
       kfree(mem);
       uvmdealloc(pagetable, a, oldsz);
@@ -412,15 +595,56 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   uint64 pa, i;
   uint flags;
   char *mem;
-  int szinc = PGSIZE;
+  int szinc;
 
   for(i = 0; i < sz; i += szinc){
+    szinc = PGSIZE; 
+
     if((pte = walk(old, i, 0)) == 0)
       continue;
-    if((*pte & PTE_V) == 0) {
+    if((*pte & PTE_V) == 0)
       continue;
+
+    // ==========================================
+    // 关键修正：准确识别大页 (Level 1 Leaf)
+    // ==========================================
+    int is_super_page = 0;
+    
+    // 1. 获取 Level 2 PTE
+    pte_t *pte_l2 = &old[PX(2, i)];
+    if(*pte_l2 & PTE_V) {
+        // 2. 计算 Level 1 PTE 的地址
+        pagetable_t pgtbl_l1 = (pagetable_t)PTE2PA(*pte_l2);
+        pte_t *pte_l1 = &pgtbl_l1[PX(1, i)];
+        
+        // 3. 只有当 walk 返回的 pte 指针就是 Level 1 的指针，且具有权限时，才是大页
+        if (pte == pte_l1 && (*pte & (PTE_R|PTE_W|PTE_X))) {
+            is_super_page = 1;
+        }
     }
-    szinc = PGSIZE;
+
+    if (is_super_page) {
+        // 只有确认为大页，且地址对齐时，才执行大页拷贝
+        if (i % SUPERPGSIZE == 0) {
+            pa = PTE2PA(*pte);
+            flags = PTE_FLAGS(*pte);
+
+            if((mem = superalloc()) == 0) {
+                goto err;
+            }
+            memmove(mem, (char*)pa, SUPERPGSIZE);
+
+            if(mappages_super(new, i, SUPERPGSIZE, (uint64)mem, flags) != 0){
+                superfree(mem);
+                goto err;
+            }
+            szinc = SUPERPGSIZE; 
+            continue; 
+        }
+    }
+    // ==========================================
+
+    // 普通页逻辑 (保持不变)
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
