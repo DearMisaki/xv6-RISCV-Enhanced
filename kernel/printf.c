@@ -149,3 +149,22 @@ printfinit(void)
 {
   initlock(&pr.lock, "pr");
 }
+
+void backtrace(void)
+{
+  // 获取当前栈底指针
+  uint64 current_fp = r_fp();
+
+  // 页是 4KB 对齐，获取页的下边界
+  uint64 boundary = PGROUNDDOWN(current_fp);
+
+  // 如何回溯的 fp 仍然在当前页中，那么代表在同一个栈中，继续回溯
+  while (PGROUNDDOWN(current_fp) == boundary)
+  {
+    uint64 ra = *((uint64*)current_fp - 1);
+
+    printf("%p\n", (void*)ra);
+
+    current_fp = *((uint64*)current_fp - 2);
+  }
+}

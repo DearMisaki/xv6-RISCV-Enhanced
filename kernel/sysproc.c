@@ -71,6 +71,10 @@ sys_pause(void)
   argint(0, &n);
   if(n < 0)
     n = 0;
+
+  // 添加对 backtrace 的支持
+  backtrace();
+
   acquire(&tickslock);
   ticks0 = ticks;
   while(ticks - ticks0 < n){
@@ -104,4 +108,28 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+uint64
+sys_sigalarm(void)
+{
+  int alarm_interval;
+  uint64 handler;
+
+  argint(0, &alarm_interval);
+  argaddr(1, &handler);
+
+  myproc()->alarm_interval = alarm_interval;
+  myproc()->alarm_handler = (void (*)())handler;
+
+  return 0;
+}
+
+uint64
+sys_sigreturn(void)
+{
+  memmove(myproc()->trapframe, myproc()->alarm_trapframe, sizeof (struct trapframe));
+  myproc()->is_alarming = 0;
+
+  return myproc()->trapframe->a0;
 }
