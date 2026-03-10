@@ -120,12 +120,12 @@ kalloc(void)
   if(r)
   {
     kmem.freelist = r->next;
-    release(&kmem.lock);
-
-    acquire(&pg_ref.lock);
-    pg_ref.cnt[(uint64)r / PGSIZE] = 1;
-    release(&pg_ref.lock);
   }
+  release(&kmem.lock);
+  
+  acquire(&pg_ref.lock);
+  pg_ref.cnt[(uint64)r / PGSIZE] = 1;
+  release(&pg_ref.lock);
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk

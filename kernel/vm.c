@@ -471,22 +471,24 @@ vmfault(pagetable_t pagetable, uint64 va, int scause)
     return 0;
   va = PGROUNDDOWN(va);
 
-  // 支持 COW page
-  // pte_t *pte = walk(pagetable, va, 0);
+  pte_t *pte = walk(pagetable, va, 0);
   
-  // scause = 15 store 异常
-  if (cowpage(pagetable, va))
+  if (pte != 0 && (*pte & PTE_V) != 0)
   {
-    // if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
-    //   return -1;
+    if ((*pte & PTE_U) == 0) return 0;
 
-    if ((mem = (uint64)cowalloc(pagetable, PGROUNDDOWN(va))) == 0)
+    if (scause == 15 && (*pte & PTE_COW))
     {
-      return 0;
+      mem = (uint64)cowalloc(pagetable, va);
+      return mem;
     }
 
-    return mem;
+    // 错误，有效页，但不是 cow 页
+    return 0;
   }
+
+  // 尝试在栈中 lazy alloc
+  if (va < PGROUNDDOWN(p->trapframe->sp)) return 0;
 
   // 支持 lazy allocation
   if(ismapped(pagetable, va)) {
