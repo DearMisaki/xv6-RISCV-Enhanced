@@ -11,6 +11,7 @@ U=user
 OBJS = \
   $K/entry.o \
   $K/kalloc.o \
+  $K/slab.o \
   $K/string.o \
   $K/main.o \
   $K/vm.o \
