@@ -10,6 +10,8 @@
 #define TX_RING_SIZE 16
 static struct tx_desc tx_ring[TX_RING_SIZE] __attribute__((aligned(16)));
 
+uint64 tx_desc_buf[TX_RING_SIZE];
+
 #define RX_RING_SIZE 16
 static struct rx_desc rx_ring[RX_RING_SIZE] __attribute__((aligned(16)));
 
@@ -105,7 +107,39 @@ e1000_transmit(char *buf, int len)
   // so that the caller knows to free buf.
   //
 
-  
+  acquire(&e1000_lock);
+
+  uint32 tail = regs[E1000_TDT];
+
+  struct tx_desc *desc = &tx_ring[tail];
+
+  // 还未发出 descriptor done 信号
+  // 代表当前的 tail 的 descriptor 还未发送成功
+  // 那么队列肯定为满的，返回失败
+  if ((desc->status & E1000_TXD_STAT_DD) == 0)
+  {
+    release(&e1000_lock);
+    return -1;
+  }
+
+  // 参数 buf 是在 send 系统调用中 使用 kalloc 创建的
+  if (tx_desc_buf[tail])
+  {
+    kfree((void*)tx_desc_buf[tail]);
+  }
+
+  tx_desc_buf[tail] = (uint64)buf;
+
+  // desc 可用
+  desc->addr = (uint64)buf;
+  desc->length = len;
+  desc->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
+
+  // 写寄存器，通知有新包到了
+  regs[E1000_TDT] = (tail + 1) % TX_RING_SIZE;
+
+  release(&e1000_lock);
+
   return 0;
 }
 
@@ -119,6 +153,34 @@ e1000_recv(void)
   // Create and deliver a buf for each packet (using net_rx()).
   //
 
+  while (1)   
+  {
+    uint32 tail = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+
+    struct rx_desc *desc = &rx_ring[tail];
+
+    // 硬件还未把数据写进来
+    if ((desc->status * E1000_RXD_STAT_DD) == 0)
+    {
+      break;
+    }
+
+    // desc 可用
+    uint16 len = desc->length;
+    uint64 buf = desc->addr;
+
+    net_rx((char*)buf, len);
+
+    desc->addr = (uint64)kalloc();
+    if (!desc->addr)
+    {
+      panic("e1000_recv");
+    }
+
+    desc->status = 0;
+
+    regs[E1000_RDT] = tail;
+  }
 }
 
 void

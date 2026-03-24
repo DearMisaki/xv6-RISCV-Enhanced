@@ -19,10 +19,33 @@ static uint8 host_mac[ETHADDR_LEN] = { 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 };
 
 static struct spinlock netlock;
 
+#define NSOCK 32
+#define SOCK_MAXQUEUE 16
+
+struct sock {
+  struct spinlock lock;
+  short port;
+  char *queue[SOCK_MAXQUEUE];
+
+  int head;
+  int tail;
+};
+
+static struct sock sockets[NSOCK];
+
 void
 netinit(void)
 {
   initlock(&netlock, "netlock");
+
+  for (int i = 0; i < NSOCK; ++i)
+  {
+    sockets[i].head = 0;
+    sockets[i].tail = 0;
+    sockets[i].port = 0;
+    initlock(&sockets[i].lock, "socket");
+  }
+
 }
 
 
@@ -34,9 +57,22 @@ netinit(void)
 uint64
 sys_bind(void)
 {
-  //
-  // Your code here.
-  //
+  int port;
+  argint(0, &port);
+
+  for (int i = 0; i < NSOCK; ++i)
+  {
+    acquire(&sockets[i].lock);
+    if (sockets[i].port == 0)
+    {
+      sockets[i].port = port;
+      sockets[i].head = 0;
+      sockets[i].tail = 0;
+      release(&sockets[i].lock);
+      return 0;
+    }
+    release(&sockets[i].lock);
+  }
 
   return -1;
 }
@@ -49,10 +85,24 @@ sys_bind(void)
 uint64
 sys_unbind(void)
 {
-  //
-  // Optional: Your code here.
-  //
+  int port;
+  argint(0, &port);
 
+  for(int i = 0; i < NSOCK; i++) {
+    acquire(&sockets[i].lock);
+    if(sockets[i].port == port) {
+      
+      // 释放队列中还没有被读取的包，防止内存泄漏
+      while(sockets[i].head != sockets[i].tail) {
+        kfree(sockets[i].queue[sockets[i].head]);
+        sockets[i].head = (sockets[i].head + 1) % SOCK_MAXQUEUE;
+      }
+      sockets[i].port = 0;
+      release(&sockets[i].lock);
+      return 0;
+    }
+    release(&sockets[i].lock);
+  }
   return 0;
 }
 
@@ -74,10 +124,71 @@ sys_unbind(void)
 uint64
 sys_recv(void)
 {
-  //
-  // Your code here.
-  //
-  return -1;
+  
+  int dport;
+  uint64 src_addr;
+  uint64 sport_addr;
+  uint64 buf_addr;
+  int maxlen;
+
+  argint(0, &dport);
+  argaddr(1, &src_addr);
+  argaddr(2, &sport_addr);
+  argaddr(3, &buf_addr);
+  argint(4, &maxlen);
+
+struct sock *sk = 0;
+  for(int i = 0; i < NSOCK; i++) {
+    acquire(&sockets[i].lock);
+    if(sockets[i].port == dport) {
+      sk = &sockets[i];
+      break;
+    }
+    release(&sockets[i].lock);
+  }
+
+  if(!sk) 
+    return -1; // 尝试从一个未绑定的端口接收
+
+  // 如果队列为空，进程在此休眠等待
+  while(sk->head == sk->tail) {
+    if(myproc()->killed) {
+      release(&sk->lock);
+      return -1;
+    }
+    sleep(&sk->head, &sk->lock);
+  }
+
+  // 取出队列中的第一个包
+  char *pkt = sk->queue[sk->head];
+  sk->head = (sk->head + 1) % SOCK_MAXQUEUE;
+  release(&sk->lock);
+
+  // 解析各个头部
+  struct eth *eth = (struct eth *)pkt;
+  struct ip *ip = (struct ip *)(eth + 1);
+  struct udp *udp = (struct udp *)(ip + 1);
+  char *payload = (char *)(udp + 1);
+
+  // 获取源 IP 和 源端口（必须使用大端转小端宏进行转换）
+  uint32 src = ntohl(ip->ip_src);
+  uint16 sport = ntohs(udp->sport);
+  
+  // 计算实际的数据载荷长度
+  int payload_len = ntohs(udp->ulen) - sizeof(struct udp);
+  int copylen = (maxlen < payload_len) ? maxlen : payload_len;
+
+  struct proc *p = myproc();
+
+  if(copyout(p->pagetable, src_addr, (char *)&src, sizeof(src)) < 0 ||
+     copyout(p->pagetable, sport_addr, (char *)&sport, sizeof(sport)) < 0 ||
+     copyout(p->pagetable, buf_addr, payload, copylen) < 0) {
+    kfree(pkt);
+    return -1;
+  }
+
+  kfree(pkt);
+  return copylen;
 }
 
 // This code is lifted from FreeBSD's ping.c, and is copyright by the Regents
@@ -179,6 +290,48 @@ sys_send(void)
   return 0;
 }
 
+void udp_recv(char *buf, int len)
+{
+  struct eth *ineth = (struct eth*)buf;
+  struct ip *inip = (struct ip *)(ineth + 1);
+
+  struct udp *inudp = (struct udp *)(inip + 1);
+
+  int dport = ntohs(inudp->dport);
+
+  for (int i = 0; i < NSOCK; ++i)
+  {
+    acquire(&sockets[i].lock);
+    if (sockets[i].port == dport)
+    {
+      int next = (sockets[i].tail + 1) % SOCK_MAXQUEUE;
+
+      if (next == sockets[i].head)
+      {
+        release(&sockets[i].lock);
+        kfree(buf);
+        return;
+      }
+
+      // 缓冲区有空闲空间
+      sockets[i].queue[sockets[i].tail] = buf;
+
+      sockets[i].tail = next;
+
+      wakeup(&sockets[i].head);
+
+      release(&sockets[i].lock);
+
+      return;
+    }
+
+    release(&sockets[i].lock);
+  }
+
+  // 无匹配端口
+  kfree(buf);
+}
+
 void
 ip_rx(char *buf, int len)
 {
@@ -188,10 +341,19 @@ ip_rx(char *buf, int len)
     printf("ip_rx: received an IP packet\n");
   seen_ip = 1;
 
-  //
-  // Your code here.
-  //
-  
+  struct eth *ineth = (struct eth*)buf;
+  struct ip *inip = (struct ip *)(ineth + 1);
+
+  if (inip->ip_p == IPPROTO_UDP)
+  {
+    udp_recv(buf, len);
+  }
+  else
+  {
+    kfree(buf);
+    return;
+  }
+
 }
 
 //
