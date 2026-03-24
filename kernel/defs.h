@@ -70,8 +70,8 @@ void*           alloc_pages(int order); // Buddy分配
 void            free_pages(void *pa, int order);
 
 // slab.c
-void            slab_init(void); // Slab初始化
-void* kmalloc(uint64 size);      // 动态内存分配
+void            slab_init(void);           // Slab初始化
+void*           kmalloc(uint64 size);      // 动态内存分配
 void            kfree_ext(void* ptr);
 
 // log.c
