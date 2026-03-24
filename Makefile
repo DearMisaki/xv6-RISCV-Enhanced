@@ -11,7 +11,6 @@ U=user
 OBJS = \
   $K/entry.o \
   $K/kalloc.o \
-  $K/slab.o \
   $K/string.o \
   $K/main.o \
   $K/vm.o \
@@ -89,7 +88,7 @@ LD = $(TOOLPREFIX)ld
 OBJCOPY = $(TOOLPREFIX)objcopy
 OBJDUMP = $(TOOLPREFIX)objdump
 
-CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb -gdwarf-2
+CFLAGS = -Wall -Werror -Wno-unknown-attributes -O -fno-omit-frame-pointer -ggdb -gdwarf-2
 
 ifdef LAB
 LABUPPER = $(shell echo $(LAB) | tr a-z A-Z)
@@ -168,7 +167,7 @@ $U/_forktest: $U/forktest.o $(ULIB)
 	$(OBJDUMP) -S $U/_forktest > $U/forktest.asm
 
 mkfs/mkfs: mkfs/mkfs.c $K/fs.h $K/param.h
-	gcc $(XCFLAGS) -Werror -Wall -I. -o mkfs/mkfs mkfs/mkfs.c
+	gcc $(XCFLAGS) -Wno-unknown-attributes -Werror -Wall -I. -o mkfs/mkfs mkfs/mkfs.c
 
 # Prevent deletion of intermediate files, e.g. cat.o, after first build, so
 # that disk image changes after first build are persistent until clean.  More
@@ -196,19 +195,22 @@ UPROGS=\
 	$U/_logstress\
 	$U/_forphan\
 	$U/_dorphan\
-	$U/_kalloctest\
 
+
+
+ifeq ($(LAB),util)
+UPROGS += \
+	$U/_sleep\
+	$U/_sixfive\
+	$U/_find
+endif
+### ENDIF
 
 
 ifeq ($(LAB),syscall)
 UPROGS += \
 	$U/_attack\
 	$U/_secret
-endif
-
-ifeq ($(LAB),lock)
-UPROGS += \
-	$U/_stats
 endif
 
 ifeq ($(LAB),traps)
@@ -253,7 +255,8 @@ endif
 ifeq ($(LAB),lock)
 UPROGS += \
 	$U/_kalloctest\
-	$U/_bcachetest
+	$U/_stats\
+	$U/_rwlktest
 endif
 
 ifeq ($(LAB),fs)
@@ -278,7 +281,9 @@ ifeq ($(LAB),util)
 	UEXTRA += user/sixfive.txt
 	UPROGS += $U/_memdump
 endif
-
+ifeq ($(LAB),syscall)
+	UEXTRA += user/exec.sh
+endif
 
 fs.img: mkfs/mkfs README $(UEXTRA) $(UPROGS)
 	mkfs/mkfs fs.img README $(UEXTRA) $(UPROGS)
@@ -307,6 +312,9 @@ CPUS := 3
 endif
 ifeq ($(LAB),fs)
 CPUS := 1
+endif
+ifeq ($(LAB),lock)
+CPUS := 4
 endif
 
 FWDPORT1 = $(shell expr `id -u` % 5000 + 25999)
