@@ -1,10 +1,10 @@
 #ifndef SLAB_H
 #define SLAB_H
 
+#include "param.h"
 #include "types.h"
 #include "list.h"
 #include "spinlock.h"
-
 
 struct slab {
     struct page *base_page;  
@@ -13,6 +13,13 @@ struct slab {
     void *freelist;          
     struct list_node list;   
     struct kmem_cache *cache; // [新增] 指向该 Slab 所属的 Cache
+};
+
+// [新增] Slab Per-CPU 结构
+struct kmem_cache_cpu {
+    struct spinlock lock;
+    void *freelist;  // 本地直接维护一个对象的单向链表
+    int count;       // 当前缓存的对象数量
 };
 
 struct kmem_cache {
@@ -25,6 +32,8 @@ struct kmem_cache {
     struct list_node slabs_full;
     struct list_node slabs_partial;
     struct list_node slabs_free;
+
+    struct kmem_cache_cpu cpu[NCPU]; // NCPU 通常为 8 [新增]
 };
 
 // 全局 API
